@@ -9,6 +9,7 @@ import org.bukkit.command.TabCompleter;
 
 import javax.annotation.Nullable;
 import java.io.File;
+import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -41,7 +42,7 @@ public class SkriptCommandTabCompleter implements TabCompleter {
 
 			// Live update, this will get all old and new (even not loaded) scripts
 			// TODO Find a better way for caching, it isn't exactly ideal to be calling this method constantly
-			try (Stream<Path> files = Files.walk(scripts.toPath())) {
+			try (Stream<Path> files = Files.walk(scripts.toPath(), FileVisitOption.FOLLOW_LINKS)) {
 				files.map(Path::toFile)
 					.forEach(file -> {
 						if (!(enable ? ScriptLoader.getDisabledScriptsFilter() : ScriptLoader.getLoadedScriptsFilter()).accept(file))

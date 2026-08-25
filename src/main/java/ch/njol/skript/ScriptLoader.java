@@ -33,6 +33,8 @@ import java.io.File;
 import java.io.FileFilter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -157,13 +159,7 @@ public class ScriptLoader {
 	public static Script getScript(File file) {
 		if (!file.isFile())
 			throw new IllegalArgumentException("Something other than a file was provided.");
-		try {
-			file = file.getCanonicalFile();
-		} catch (IOException e) {
-			//noinspection ThrowableNotThrown
-			Skript.exception(e, "An exception occurred while trying to get the canonical file of: " + file);
-			return null;
-		}
+		file = file.toPath().toAbsolutePath().normalize().toFile();
 		for (Script script : loadedScripts) {
 			if (file.equals(script.getConfig().getFile()))
 				return script;
@@ -213,7 +209,7 @@ public class ScriptLoader {
 	 */
 	static void updateDisabledScripts(Path path) {
 		disabledScripts.clear();
-		try (Stream<Path> files = Files.walk(path)) {
+		try (Stream<Path> files = Files.walk(path, FileVisitOption.FOLLOW_LINKS)) {
 			files.map(Path::toFile)
 				.filter(disabledScriptFilter::accept)
 				.forEach(disabledScripts::add);
@@ -469,7 +465,7 @@ public class ScriptLoader {
 	 * @param script The script to stop tracking.
 	 */
 	private static void untrack(Script script) {
-		// Loaded scripts are created with canonical files
+		// Loaded scripts are created with absolute, normalized files.
 		trackedFiles.remove(script.getConfig().getFile());
 	}
 
@@ -774,32 +770,42 @@ public class ScriptLoader {
 			return config != null ? Collections.singletonList(config) : Collections.emptyList();
 		}
 
-		try {
-			directory = directory.getCanonicalFile();
+		directory = directory.toPath().toAbsolutePath().normalize().toFile();
+		List<File> files;
+		try (Stream<Path> paths = Files.walk(directory.toPath(), FileVisitOption.FOLLOW_LINKS)) {
+			Path directoryPath = directory.toPath();
+			files = paths
+				.filter(path -> !Files.isDirectory(path))
+				.filter(path -> isVisiblePath(directoryPath.relativize(path)))
+				.map(Path::toFile)
+				.filter(loadedScriptFilter::accept)
+				.sorted(Comparator
+					.comparingInt((File file) -> file.toPath().getNameCount()).reversed()
+					.thenComparing(File::compareTo))
+				.collect(Collectors.toList());
+		} catch (UncheckedIOException e) {
+			Skript.error("Could not scan " + directory.getName() + ": " + ExceptionUtils.toString(e.getCause()));
+			return Collections.emptyList();
 		} catch (IOException e) {
-			//noinspection ThrowableNotThrown
-			Skript.exception(e, "An exception occurred while trying to get the canonical file of: " + directory);
-			return new ArrayList<>();
+			Skript.error("Could not scan " + directory.getName() + ": " + ExceptionUtils.toString(e));
+			return Collections.emptyList();
 		}
 
-		File[] files = directory.listFiles(loadedScriptFilter);
-		assert files != null;
-		Arrays.sort(files);
-
-		List<Config> loadedDirectories = new ArrayList<>(files.length);
-		List<Config> loadedFiles = new ArrayList<>(files.length);
+		List<Config> configs = new ArrayList<>(files.size());
 		for (File file : files) {
-			if (file.isDirectory()) {
-				loadedDirectories.addAll(loadStructures(file));
-			} else {
-				Config cfg = loadStructure(file);
-				if (cfg != null)
-					loadedFiles.add(cfg);
-			}
+			Config config = loadStructure(file);
+			if (config != null)
+				configs.add(config);
 		}
+		return configs;
+	}
 
-		loadedDirectories.addAll(loadedFiles);
-		return loadedDirectories;
+	private static boolean isVisiblePath(Path path) {
+		for (Path part : path) {
+			if (part.toString().startsWith("."))
+				return false;
+		}
+		return true;
 	}
 
 	/**
@@ -810,13 +816,7 @@ public class ScriptLoader {
 	 */
 	@Nullable
 	private static Config loadStructure(File file) {
-		try {
-			file = file.getCanonicalFile();
-		} catch (IOException e) {
-			//noinspection ThrowableNotThrown
-			Skript.exception(e, "An exception occurred while trying to get the canonical file of: " + file);
-			return null;
-		}
+		file = file.toPath().toAbsolutePath().normalize().toFile();
 
 		if (!file.exists()) { // If file does not exist...
 			Script script = getScript(file);
@@ -828,8 +828,9 @@ public class ScriptLoader {
 		track(file);
 
 		try {
-			String name = Skript.getInstance().getDataFolder().toPath().toAbsolutePath()
-					.resolve(Skript.SCRIPTSFOLDER).relativize(file.toPath().toAbsolutePath()).toString();
+			Path scriptsPath = Skript.getInstance().getScriptsFolder().toPath()
+				.toAbsolutePath().normalize();
+			String name = scriptsPath.relativize(file.toPath()).toString();
 			return loadStructure(Files.newInputStream(file.toPath()), name);
 		} catch (IOException e) {
 			Skript.error("Could not load " + file.getName() + ": " + ExceptionUtils.toString(e));
@@ -848,10 +849,13 @@ public class ScriptLoader {
 	@Nullable
 	private static Config loadStructure(InputStream source, String name) {
 		try {
+			File file = Skript.getInstance().getScriptsFolder().toPath()
+				.toAbsolutePath().normalize()
+				.resolve(name).normalize().toFile();
 			return new Config(
 				source,
 				name,
-				Skript.getInstance().getDataFolder().toPath().resolve(Skript.SCRIPTSFOLDER).resolve(name).toFile().getCanonicalFile(),
+				file,
 				true,
 				false,
 				":"
@@ -1355,15 +1359,12 @@ public class ScriptLoader {
 				return null;
 			}
 		}
-		try {
-			// Unless it's a test, check if the user is asking for a script in the scripts folder
-			// and not something outside Skript's domain.
-			if (TestMode.ENABLED || scriptFile.getCanonicalPath().startsWith(directory.getCanonicalPath() + File.separator))
-				return scriptFile.getCanonicalFile();
-			return null;
-		} catch (IOException e) {
-			throw Skript.exception(e, "An exception occurred while trying to get the script file from the string '" + script + "'");
-		}
+		Path directoryPath = directory.toPath().toAbsolutePath().normalize();
+		Path scriptPath = scriptFile.toPath().toAbsolutePath().normalize();
+		// Check the path as entered, not the symlink target, so links inside the scripts folder remain usable.
+		if (TestMode.ENABLED || scriptPath.startsWith(directoryPath))
+			return scriptPath.toFile();
+		return null;
 	}
 
 }
